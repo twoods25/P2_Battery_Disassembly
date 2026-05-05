@@ -1,23 +1,16 @@
 """
 camera.py
 ---------
-Captures a single snapshot on startup, detects red/blue blocks inside a
-crop/zoom window, and returns a structured work order for the robot loop.
+Snapshot-based color blob detector for pick-and-place work order generation.
 
-Output: a list of 8 dicts, sorted left-to-right / top-to-bottom:
-    [
-        {'index': 0, 'color': 'red',  'pick': True,  'pixel': (cx, cy)},
-        {'index': 1, 'color': 'blue', 'pick': False, 'pixel': (cx, cy)},
-        ...
-    ]
+Internally the blob detector represents each detected region as a circle
+with a center point (kp.pt) and diameter (kp.size). We draw rectangles
+over these for clarity, but the detection itself is circle-based.
 
-'pick' is True for red blocks, False for blue — change the rule in should_pick().
-
---- Workflow for setting up the crop window ---
-1. Run:  python camera.py --adjust
-2. Use the trackbars to center and zoom the window over the 8 modules.
-3. The console prints the final CROP values when you press Q.
-4. Paste those values into the CROP dict below and you are done.
+Setup workflow (run once):
+    python camera.py --focus    →  tune focus, paste value into FOCUS below
+    python camera.py --adjust   →  tune trim, paste values into CROP below
+    python camera.py            →  verify detection, tune BLOB params if needed
 """
 
 import cv2
@@ -25,137 +18,161 @@ import numpy as np
 import argparse
 from util import get_limits
 
-# ─────────────────────────────────────────────
-# Configuration  (tune these values as needed)
-# ─────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════
+# PARAMETERS  —  only edit values in this section
+# ═══════════════════════════════════════════════════════════════
 
-CAMERA_INDEX   = 1        # which camera to open (0 = built-in, 1 = external)
-EXPECTED_COUNT = 8        # how many blocks we expect to find
-MIN_AREA       = 500      # minimum contour area to count as a real block (filters noise)
+# Camera
+CAMERA_INDEX = 1
+RESOLUTION   = (1920, 1080)
+FOCUS        = 0          # manual focus value (run --focus to tune)
 
-# BGR values for each color we want to detect
+# Detection
+EXPECTED_COUNT = 8
 COLORS = {
     'red':  [0, 0, 255],
     'blue': [255, 0, 0],
 }
 
-# ─────────────────────────────────────────────
-# Crop / zoom configuration
-# ─────────────────────────────────────────────
-# Run `python camera.py --adjust` to tune these values visually.
-# Paste the printed output back here once you are happy with the crop window.
-#
-#   center_x / center_y : where to point the crop (0.0 = left/top, 1.0 = right/bottom)
-#   zoom                 : how tight the crop is  (1.0 = full frame, 3.0 = one third, etc.)
-
+# Trim  —  fraction to cut from each side (0.0 = none, 0.5 = half)
+# Run --adjust to tune these visually
 CROP = {
-    'center_x': 0.5,    # horizontal center of the work area (0.0 – 1.0)
-    'center_y': 0.5,    # vertical center of the work area   (0.0 – 1.0)
-    'zoom':     1.5,    # zoom level — higher = tighter/smaller crop window
+    'trim_top':    0.04,
+    'trim_bottom': 0.15,
+    'trim_left':   0.16,
+    'trim_right':  0.52,
 }
 
+# Blob detector parameters
+# The detector internally fits a circle to each blob region.
+# kp.pt   = center of the circle (x, y)
+# kp.size = diameter of the circle
+#
+# min/max_area     — controls the valid size range for a module blob
+# min_circularity  — how close to a perfect circle (1.0). Keep low for rectangles
+# min_convexity    — how convex the shape must be. Keep low for notched modules
+# min_inertia      — how elongated the shape can be. 0.01 allows any elongation
+BLOB = {
+    'min_threshold':   10,
+    'max_threshold':   200,
+    'min_area':        500,    # lower catches smaller/partial blobs
+    'max_area':        25000,  # reduced to prevent two adjacent modules merging
+    'min_circularity': 0.05,   # very low — modules are rectangular not circular
+    'min_convexity':   0.1,    # low — side notches reduce convexity
+    'min_inertia':     0.01,   # low — allows elongated shapes
+}
 
-# ─────────────────────────────────────────────
-# Decision rule  (single place to change logic)
-# ─────────────────────────────────────────────
+# Morphological kernel size
+# Smaller = less gap-filling between adjacent modules (prevents merging)
+# Larger  = better at filling holes/notches inside a single module
+MORPH_KERNEL = 11
+
+# ═══════════════════════════════════════════════════════════════
+# END OF PARAMETERS
+# ═══════════════════════════════════════════════════════════════
+
 
 def should_pick(color: str) -> bool:
-    """Return True if this block color should be picked. Red = pick, blue = skip."""
+    """Pick rule — red = pick, blue = skip. Change here if logic changes."""
     return color == 'red'
 
 
-# ─────────────────────────────────────────────
-# Crop helper
-# ─────────────────────────────────────────────
+def configure_camera(cap) -> None:
+    """Lock resolution and disable autofocus."""
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+    cap.set(cv2.CAP_PROP_FOCUS, FOCUS)
+    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    print(f"[camera] {w:.0f}x{h:.0f}  focus={FOCUS}")
 
-def apply_crop(frame, crop: dict) -> np.ndarray:
-    """
-    Crop and resize a region of the frame based on center position and zoom.
 
-    How it works:
-      - zoom=1.0  → full frame (no crop)
-      - zoom=2.0  → crop a window that is half the frame width/height
-      - zoom=3.0  → crop a window that is a third of the frame width/height
-    The cropped region is then resized back to the original frame dimensions
-    so all downstream code sees the same image size.
-    """
+def apply_trim(frame) -> np.ndarray:
+    """Slice the frame to the work area — no rescaling, no quality loss."""
     h, w = frame.shape[:2]
-
-    # Calculate the width/height of the crop window
-    crop_w = int(w / crop['zoom'])
-    crop_h = int(h / crop['zoom'])
-
-    # Calculate the top-left corner of the crop window from the center point
-    cx = int(crop['center_x'] * w)
-    cy = int(crop['center_y'] * h)
-    x1 = max(cx - crop_w // 2, 0)
-    y1 = max(cy - crop_h // 2, 0)
-
-    # Make sure the window does not go outside the frame boundaries
-    x1 = min(x1, w - crop_w)
-    y1 = min(y1, h - crop_h)
-    x2 = x1 + crop_w
-    y2 = y1 + crop_h
-
-    # Crop and scale back to original resolution
-    cropped = frame[y1:y2, x1:x2]
-    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+    y1 = int(h * CROP['trim_top'])
+    y2 = int(h * (1.0 - CROP['trim_bottom']))
+    x1 = int(w * CROP['trim_left'])
+    x2 = int(w * (1.0 - CROP['trim_right']))
+    return frame[y1:y2, x1:x2]
 
 
-# ─────────────────────────────────────────────
-# Detection helpers
-# ─────────────────────────────────────────────
-
-def detect_blocks(hsv_frame, color_name, bgr_value) -> list:
+def make_blob_detector() -> cv2.SimpleBlobDetector:
     """
-    Detect all blocks of a given color in an HSV frame.
-    Returns a list of dicts with bbox and center pixel for each block found.
+    Build the blob detector from BLOB parameters.
+    The detector fits a circle to each blob and returns center + diameter.
     """
-    # Build a binary mask where pixels matching the color are white
+    p = cv2.SimpleBlobDetector_Params()
+    p.minThreshold        = BLOB['min_threshold']
+    p.maxThreshold        = BLOB['max_threshold']
+    p.filterByArea        = True
+    p.minArea             = BLOB['min_area']
+    p.maxArea             = BLOB['max_area']
+    p.filterByCircularity = True
+    p.minCircularity      = BLOB['min_circularity']
+    p.filterByConvexity   = True
+    p.minConvexity        = BLOB['min_convexity']
+    p.filterByInertia     = True
+    p.minInertiaRatio     = BLOB['min_inertia']
+    p.filterByColor       = False
+    return cv2.SimpleBlobDetector_create(p)
+
+
+# Single shared detector instance
+DETECTOR = make_blob_detector()
+
+
+def detect_blobs(frame, color_name, bgr_value) -> list:
+    """
+    Full detection pipeline for one color:
+      blur → HSV mask → open → close → invert → blob detect
+
+    The blob detector returns keypoints where:
+      kp.pt   = (cx, cy) center of the fitted circle
+      kp.size = diameter of the fitted circle
+
+    We convert the circle into a square bbox for display.
+    """
+    blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
     lower, upper = get_limits(color=bgr_value)
-    mask = cv2.inRange(hsv_frame, lower, upper)
+    mask = cv2.inRange(hsv, lower, upper)
 
-    # Morphological open removes small noise specks (erode then dilate)
-    # Morphological close fills small holes inside detected regions (dilate then erode)
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    kernel = np.ones((MORPH_KERNEL, MORPH_KERNEL), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)  # remove noise specks
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)  # fill holes/notches
 
-    # Find contours (outlines) of white regions in the mask
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Invert — blob detector needs dark blobs on white background
+    keypoints = DETECTOR.detect(cv2.bitwise_not(mask))
 
-    blocks = []
-    for contour in contours:
-        if cv2.contourArea(contour) < MIN_AREA:
-            continue  # too small — likely noise, skip it
-
-        x, y, w, h = cv2.boundingRect(contour)
-        blocks.append({
+    # Convert each keypoint circle into a block dict
+    return [
+        {
             'color': color_name,
-            'bbox':  (x, y, x + w, y + h),       # (x1, y1, x2, y2)
-            'pixel': (x + w // 2, y + h // 2),    # center point (cx, cy)
-        })
-
-    return blocks
+            'pixel': (int(kp.pt[0]), int(kp.pt[1])),          # circle center
+            'bbox':  (int(kp.pt[0] - kp.size / 2),            # square bbox
+                      int(kp.pt[1] - kp.size / 2),            # derived from
+                      int(kp.pt[0] + kp.size / 2),            # circle radius
+                      int(kp.pt[1] + kp.size / 2)),
+        }
+        for kp in keypoints
+    ]
 
 
 def build_work_order(frame) -> list:
     """
-    Detect all colored blocks in a single frame and return a sorted work order.
-    Sorted left-to-right (by X), then top-to-bottom (by Y) within same column.
-    Each entry gets a 'pick' flag and a sequential index.
+    Detect all blocks, sort left-to-right then top-to-bottom,
+    assign index and pick flag to each.
     """
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-
-    # Collect blocks for every configured color
     all_blocks = []
     for color_name, bgr_value in COLORS.items():
-        all_blocks.extend(detect_blocks(hsv, color_name, bgr_value))
+        all_blocks.extend(detect_blobs(frame, color_name, bgr_value))
 
-    # Sort: primary = X (left to right), secondary = Y (top to bottom)
+    # Sort: left to right (X), then top to bottom (Y)
     all_blocks.sort(key=lambda b: (b['pixel'][0], b['pixel'][1]))
 
-    # Assign index and pick decision to each block
     for i, block in enumerate(all_blocks):
         block['index'] = i
         block['pick']  = should_pick(block['color'])
@@ -163,80 +180,56 @@ def build_work_order(frame) -> list:
     return all_blocks
 
 
-# ─────────────────────────────────────────────
-# Visualisation  (drawn on the snapshot preview)
-# ─────────────────────────────────────────────
-
 def draw_results(frame, work_order) -> None:
-    """
-    Draw bounding boxes, index numbers, and PICK/SKIP labels on the frame.
-    Modifies the frame in place.
-    """
+    """Draw boxes, center dots, and labels on the frame in place."""
     style = {
-        'red':  {'border': (0, 0, 255), 'fill': (0, 0, 200)},
-        'blue': {'border': (255, 0, 0), 'fill': (200, 0, 0)},
+        'red':  {'border': (0, 0, 255), 'fill': (0, 0, 180)},
+        'blue': {'border': (255, 0, 0), 'fill': (180, 0, 0)},
     }
 
-    for block in work_order:
-        x1, y1, x2, y2 = block['bbox']
-        cx, cy          = block['pixel']
-        s               = style[block['color']]
+    for b in work_order:
+        x1, y1, x2, y2 = b['bbox']
+        cx, cy          = b['pixel']
+        s               = style[b['color']]
 
-        # Semi-transparent filled rectangle
         overlay = frame.copy()
         cv2.rectangle(overlay, (x1, y1), (x2, y2), s['fill'], -1)
         cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-
         cv2.rectangle(frame, (x1, y1), (x2, y2), s['border'], 2)
+        cv2.circle(frame, (cx, cy), 4, (255, 255, 255), -1)  # blob center dot
 
-        # Index label top-left, PICK/SKIP label center
-        cv2.putText(frame, f"#{block['index']}",
+        cv2.putText(frame, f"#{b['index']}",
                     (x1 + 4, y1 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
-        label       = "PICK" if block['pick'] else "SKIP"
-        label_color = (0, 255, 0) if block['pick'] else (0, 165, 255)
+        label       = "PICK" if b['pick'] else "SKIP"
+        label_color = (0, 255, 0) if b['pick'] else (0, 165, 255)
         cv2.putText(frame, label,
                     (cx - 18, cy + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, label_color, 2)
 
-    cv2.putText(frame, f"Detected: {len(work_order)}/{EXPECTED_COUNT} blocks",
+    cv2.putText(frame, f"Detected: {len(work_order)}/{EXPECTED_COUNT}",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
     cv2.putText(frame, "Press any key to continue ...",
                 (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
 
 
 # ─────────────────────────────────────────────
-# Crop adjustment mode
+# Adjustment modes
 # ─────────────────────────────────────────────
 
-def adjust_crop():
+def adjust_trim():
     """
-    Interactive live mode for tuning the crop window.
-
-    Opens the camera feed with three trackbars:
-        Center X  — horizontal position of the crop center
-        Center Y  — vertical position of the crop center
-        Zoom x10  — zoom level (10 = 1.0x, 30 = 3.0x, etc.)
-
-    A green rectangle shows exactly what area will be cropped.
-    Press Q to exit — the final values are printed to the console
-    so you can paste them into the CROP dict above.
+    Live trim adjustment with 4 trackbars (top/bottom/left/right).
+    Press Q — prints final CROP values to paste into parameters above.
     """
     cap = cv2.VideoCapture(CAMERA_INDEX)
-    if not cap.isOpened():
-        print(f"[camera] ERROR: could not open camera index {CAMERA_INDEX}")
-        return
+    configure_camera(cap)
 
-    win = "Crop Adjustment  (Q to finish)"
+    win = "Trim Adjustment  (Q to finish)"
     cv2.namedWindow(win)
 
-    # Trackbars use integers, so we scale:
-    #   center: 0–100 maps to 0.0–1.0
-    #   zoom:   10–50 maps to 1.0–5.0  (divided by 10)
-    cv2.createTrackbar("Center X", win, int(CROP['center_x'] * 100), 100, lambda v: None)
-    cv2.createTrackbar("Center Y", win, int(CROP['center_y'] * 100), 100, lambda v: None)
-    cv2.createTrackbar("Zoom x10", win, int(CROP['zoom'] * 10),       50,  lambda v: None)
-
-    print("[camera] Adjust the trackbars to frame the work area, then press Q.")
+    for side, key in [("Top", 'trim_top'), ("Bottom", 'trim_bottom'),
+                      ("Left", 'trim_left'), ("Right", 'trim_right')]:
+        cv2.createTrackbar(f"Trim {side}", win, int(CROP[key] * 100), 100, lambda v: None)
 
     while True:
         ret, frame = cap.read()
@@ -244,46 +237,58 @@ def adjust_crop():
             break
 
         h, w = frame.shape[:2]
+        t = cv2.getTrackbarPos("Trim Top",    win) / 100
+        b = cv2.getTrackbarPos("Trim Bottom", win) / 100
+        l = cv2.getTrackbarPos("Trim Left",   win) / 100
+        r = cv2.getTrackbarPos("Trim Right",  win) / 100
 
-        # Read current trackbar values and convert back to floats
-        cx_pct = cv2.getTrackbarPos("Center X", win) / 100
-        cy_pct = cv2.getTrackbarPos("Center Y", win) / 100
-        zoom   = max(cv2.getTrackbarPos("Zoom x10", win) / 10, 1.0)  # minimum 1.0
+        y1, y2 = int(h * t), int(h * (1 - b))
+        x1, x2 = int(w * l), int(w * (1 - r))
 
-        # Calculate the crop rectangle in pixel coordinates for the preview overlay
-        crop_w = int(w / zoom)
-        crop_h = int(h / zoom)
-        cx_px  = int(cx_pct * w)
-        cy_px  = int(cy_pct * h)
-        rx1    = max(cx_px - crop_w // 2, 0)
-        ry1    = max(cy_px - crop_h // 2, 0)
-        rx1    = min(rx1, w - crop_w)
-        ry1    = min(ry1, h - crop_h)
-        rx2    = rx1 + crop_w
-        ry2    = ry1 + crop_h
-
-        # Dim everything outside the crop window so the selection stands out
-        dimmed = frame.copy()
-        dimmed[:, :]           = (frame * 0.35).astype(np.uint8)  # dim whole frame
-        dimmed[ry1:ry2, rx1:rx2] = frame[ry1:ry2, rx1:rx2]        # restore crop area
-
-        # Draw green crop border and current values
-        cv2.rectangle(dimmed, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
-        cv2.putText(dimmed, f"zoom={zoom:.1f}x  center=({cx_pct:.2f}, {cy_pct:.2f})",
+        dimmed = (frame * 0.35).astype(np.uint8)
+        dimmed[y1:y2, x1:x2] = frame[y1:y2, x1:x2]
+        cv2.rectangle(dimmed, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(dimmed, f"T={t:.2f} B={b:.2f} L={l:.2f} R={r:.2f}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(dimmed, "Press Q when happy with the crop",
+        cv2.putText(dimmed, "Press Q when done",
                     (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1)
-
         cv2.imshow(win, dimmed)
 
         if cv2.waitKey(1) & 0xFF == ord('q'):
-            # Print the final values ready to paste into CROP above
-            print("\n[camera] Paste these values into the CROP dict in camera.py:")
-            print( "CROP = {")
-            print(f"    'center_x': {cx_pct:.2f},")
-            print(f"    'center_y': {cy_pct:.2f},")
-            print(f"    'zoom':     {zoom:.1f},")
-            print( "}")
+            print("\n[camera] Paste into CROP in camera.py:")
+            print(f"CROP = {{'trim_top': {t:.2f}, 'trim_bottom': {b:.2f}, "
+                  f"'trim_left': {l:.2f}, 'trim_right': {r:.2f}}}")
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+
+def adjust_focus():
+    """
+    Live focus adjustment with a single trackbar.
+    Press Q — prints final focus value to paste into FOCUS above.
+    """
+    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+
+    win = "Focus Adjustment  (Q to finish)"
+    cv2.namedWindow(win)
+    cv2.createTrackbar("Focus", win, FOCUS, 255, lambda v: None)
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        focus = cv2.getTrackbarPos("Focus", win)
+        cap.set(cv2.CAP_PROP_FOCUS, focus)
+        cv2.putText(frame, f"Focus: {focus}  (Q to save)",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.imshow(win, frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print(f"\n[camera] Paste into parameters: FOCUS = {focus}")
             break
 
     cap.release()
@@ -296,46 +301,37 @@ def adjust_crop():
 
 def capture_work_order() -> list:
     """
-    Open the camera, grab ONE snapshot, apply the crop window, detect blocks,
-    show the result, and return the work order list.
-
-    Call this once at program startup before the robot loop begins.
-    Returns an empty list if the camera cannot be opened.
+    Grab one snapshot, trim, detect, display, return work order.
+    Call once at program startup before the robot loop.
     """
     cap = cv2.VideoCapture(CAMERA_INDEX)
     if not cap.isOpened():
-        print(f"[camera] ERROR: could not open camera index {CAMERA_INDEX}")
+        print(f"[camera] ERROR: could not open camera {CAMERA_INDEX}")
         return []
 
-    ret, frame = cap.read()   # single snapshot — no continuous loop needed
-    cap.release()             # release the camera immediately to free resources
+    configure_camera(cap)
+    ret, frame = cap.read()
+    cap.release()
 
     if not ret:
-        print("[camera] ERROR: failed to read frame from camera")
+        print("[camera] ERROR: failed to capture frame")
         return []
 
-    # Apply the crop/zoom window — only the work area is evaluated from here on
-    frame = apply_crop(frame, CROP)
-
-    # Build the work order from the cropped snapshot
+    frame      = apply_trim(frame)
     work_order = build_work_order(frame)
 
     if len(work_order) != EXPECTED_COUNT:
-        print(f"[camera] WARNING: expected {EXPECTED_COUNT} blocks, "
-              f"found {len(work_order)}")
+        print(f"[camera] WARNING: expected {EXPECTED_COUNT}, found {len(work_order)}")
 
-    # Show the annotated result until a key is pressed
     draw_results(frame, work_order)
-    cv2.imshow("Snapshot — Block Detection", frame)
+    cv2.imshow("Block Detection", frame)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-    # Print work order summary to console
     print("\n[camera] Work order:")
-    for block in work_order:
-        action = "PICK" if block['pick'] else "SKIP"
-        print(f"  #{block['index']}  {block['color'].upper():4s}  →  {action}  "
-              f"pixel=({block['pixel'][0]}, {block['pixel'][1]})")
+    for b in work_order:
+        print(f"  #{b['index']}  {b['color'].upper():4s}  "
+              f"{'PICK' if b['pick'] else 'SKIP'}  pixel={b['pixel']}")
 
     return work_order
 
@@ -345,16 +341,15 @@ def capture_work_order() -> list:
 # ─────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # Run with --adjust to enter the interactive crop tuning mode
-    # Run with no arguments for a normal detection snapshot
     parser = argparse.ArgumentParser()
-    parser.add_argument("--adjust", action="store_true",
-                        help="Open interactive crop adjustment window")
+    parser.add_argument("--adjust", action="store_true", help="Tune trim window")
+    parser.add_argument("--focus",  action="store_true", help="Tune focus")
     args = parser.parse_args()
 
     if args.adjust:
-        adjust_crop()
+        adjust_trim()
+    elif args.focus:
+        adjust_focus()
     else:
         work_order = capture_work_order()
-        pick_flags = [b['pick'] for b in work_order]
-        print(f"\nRobot pick array: {pick_flags}")
+        print(f"\nPick array: {[b['pick'] for b in work_order]}")
