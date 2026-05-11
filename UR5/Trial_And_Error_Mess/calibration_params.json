@@ -1,0 +1,31 @@
+{
+    "focus_value": 0,
+    "crop": {
+        "x": 827,
+        "y": 458,
+        "w": 392,
+        "h": 275
+    },
+    "hsv": {
+        "r1_h_min": 0,
+        "r1_s_min": 97,
+        "r1_v_min": 85,
+        "r1_h_max": 10,
+        "r2_h_min": 170,
+        "r2_h_max": 180,
+        "b_h_min": 98,
+        "b_s_min": 187,
+        "b_v_min": 26,
+        "b_h_max": 162,
+        "b_s_max": 255,
+        "b_v_max": 255
+    },
+    "morphology": {
+        "erode": 7,
+        "dilate": 9
+    },
+    "blob": {
+        "min_area": 3027,
+        "max_area": 50000
+    }
+}

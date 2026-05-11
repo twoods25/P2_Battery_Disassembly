@@ -20,7 +20,7 @@ DEBUG_ENABLED = True
 DEBUG_CONFIG = {
     'log_initialize': True,                 # Logs camera index, buffer, resolution, focus on init
     'log_frame_grab': False,
-    'live_feed': False,
+    'live_feed': True,
     'show_frame': False,
     'show_frame_shape': False,
 }
@@ -34,8 +34,9 @@ CALIBRATION_CONFIG = {
     'crop_width': 800,      # Width of crop region
     'crop_height': 600,     # Height of crop region
     'display_scale': 1.0,
+    'module_surface_z': 31,  # Height of module surface above Z=0 in mm.
 }
-CAMERA_POSITION_XYZ = np.array([520, 160, 982])
+CAMERA_POSITION_XYZ = np.array([526, 160, 982])
 CORNER_LABELS = ['Top-Left', 'Top-Right', 'Bottom-Right', 'Bottom-Left']
 HOMOGRAPHY_SAVE_PATH = 'homography.npy'
 
@@ -84,7 +85,7 @@ def get_frame() -> np.ndarray:
         RuntimeError: If the frame could not be retrieved.
     """
     if cap is None:
-       raise RuntimeError('Camera not initialized, call initialize() first')
+       raise RuntimeError('Camera not initialized, call initialize() first.')
     cap.grab()
     ret, frame = cap.retrieve()
     if not ret:
@@ -226,12 +227,14 @@ def _clicks_to_world(
     """
     focal_length = CALIBRATION_CONFIG['focal_length']
     camera_x, camera_y, camera_z = CAMERA_POSITION_XYZ
+    module_z = CALIBRATION_CONFIG['module_surface_z']  # 27.08mm
+    effective_z = camera_z - module_z                   # Actual distance to module surface.
     image_cx = CALIBRATION_CONFIG['frame_width'] / 2
     image_cy = CALIBRATION_CONFIG['frame_height'] / 2
     world_points = []
     for px, py in clicks:
-        world_x = camera_x + (px - image_cx) * (camera_z / focal_length)
-        world_y = camera_y + (py - image_cy) * (camera_z / focal_length)
+        world_x = camera_x + (py - image_cy) * (effective_z / focal_length)
+        world_y = camera_y + (px - image_cx) * (effective_z / focal_length)
         world_points.append([world_x, world_y])
     return np.array(world_points, dtype=np.float32)
 
@@ -478,8 +481,8 @@ def function_name(param_one: int, param_two: str | None = None) -> int:
 
 
 if __name__ == '__main__':
-    initialize(1,1)
-    if 'live_feed':
+    initialize(1, 1)
+    if DEBUG_ENABLED and DEBUG_CONFIG['live_feed']:
         show_live_feed()
     homography_matrix = setup_homography()
     print(apply_homography(homography_matrix, (842, 501)))
