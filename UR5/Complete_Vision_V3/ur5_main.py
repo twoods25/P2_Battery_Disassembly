@@ -13,7 +13,6 @@ import cv2
 from ur5_vision import CAMERA_CONFIG, Camera, Detector, Homography, load_params
 from ur5_ui import ask_operator, run_homography_setup, save_detection_image, show_detection
 
-
 def main() -> None:
     """Runs the UR5 battery disassembly production loop."""
     print('--- UR5 Battery Disassembly System ---')

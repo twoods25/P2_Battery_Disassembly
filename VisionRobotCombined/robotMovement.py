@@ -19,6 +19,7 @@ def init(rdk, rob):
     global RDK, robot
     RDK = rdk
     robot = rob
+    robot.setSpeed(400, 240, 2000, 160)  # linear speed, joint speed, linear accel, joint accel
 
 
 def getTarget(name):
