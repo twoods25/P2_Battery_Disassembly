@@ -19,7 +19,7 @@ def init(rdk, rob):
     global RDK, robot
     RDK = rdk
     robot = rob
-    robot.setSpeed(400, 240, 2000, 160)  # linear speed, joint speed, linear accel, joint accel
+    #robot.setSpeed(400, 240, 2000, 160)  # linear speed, joint speed, linear accel, joint accel
 
 
 def getTarget(name):
@@ -126,13 +126,13 @@ def makeModuleTarget(name, x, y, z):
 def openGripper():
     robot.setDO(7, 0)
     robot.setDO(6, 1)
-    time.sleep(0.5)
+    time.sleep(0.1)
 
 
 def closeGripper():
     robot.setDO(6, 0)
     robot.setDO(7, 1)
-    time.sleep(0.5)
+    time.sleep(0.1)
 
 
 def moveToPlace(position=None, x=None, y=None, z=None, useTarget=True):
@@ -182,6 +182,60 @@ def pickOrPlace(
             openGripper()
 
         useTargetFrame(above_target)
+        robot.MoveL(above_target)
+
+    else:
+        # Modulkoordinater bruger World frame
+        useWorldFrame()
+
+        above_target = makeModuleTarget(
+            "Temp module above",
+            x,
+            y,
+            z + MODULE_APPROACH_HEIGHT
+        )
+
+        on_target = makeModuleTarget(
+            "Temp module on",
+            x,
+            y,
+            z
+        )
+
+        robot.MoveL(on_target)
+
+        if gripper == "close":
+            closeGripper()
+        else:
+            openGripper()
+
+        robot.MoveL(above_target)
+
+def pickOrPlaceLid(
+    above=None,
+    on=None,
+    x=None,
+    y=None,
+    z=None,
+    gripper="close",
+    useTarget=True
+):
+    if useTarget:
+        on_target = getTarget(on)
+        above_target = getTarget(above)
+
+        # Faste targets bruger targetets egen frame
+        useTargetFrame(on_target)
+        robot.setSpeed(800, 480, 4000, 400)
+        robot.MoveL(on_target)
+
+        if gripper == "close":
+            closeGripper()
+        else:
+            openGripper()
+
+        useTargetFrame(above_target)
+        robot.setSpeed(100, 60, 500, 40)
         robot.MoveL(above_target)
 
     else:
