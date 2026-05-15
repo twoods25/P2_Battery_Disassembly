@@ -126,13 +126,13 @@ def makeModuleTarget(name, x, y, z):
 def openGripper():
     robot.setDO(7, 0)
     robot.setDO(6, 1)
-    time.sleep(0.1)
+    time.sleep(0.05)
 
 
 def closeGripper():
     robot.setDO(6, 0)
     robot.setDO(7, 1)
-    time.sleep(0.1)
+    time.sleep(0.05)
 
 
 def moveToPlace(position=None, x=None, y=None, z=None, useTarget=True):
@@ -235,7 +235,7 @@ def pickOrPlaceLid(
             openGripper()
 
         useTargetFrame(above_target)
-        robot.setSpeed(100, 60, 500, 40)
+        robot.setSpeed(200, 120, 1000, 80)
         robot.MoveL(above_target)
 
     else:

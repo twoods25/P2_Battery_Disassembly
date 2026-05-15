@@ -53,7 +53,7 @@ def main() -> None:
 
     while True:
         
-        robot.setSpeed(800, 480, 4000, 400)  # linear speed, joint speed, linear accel, joint accel. For the lid
+        robot.setSpeed(1500, 900, 7500, 750)  # linear speed, joint speed, linear accel, joint accel. For the lid
         rm.moveToPlace("above_lid_dump", useTarget=True) #above_lid_dump, is also the homeposition
 
         rm.moveToPlace("above_lid", useTarget=True)
@@ -85,7 +85,7 @@ def main() -> None:
 
         # To save the detection result image, remove the # from the line below.
         # save_detection_image(frame, result)
-        robot.setSpeed(800, 480, 4000, 400)  # linear speed, joint speed, linear accel, joint accel. For muduels
+        robot.setSpeed(1500, 900, 7500, 750)  # linear speed, joint speed, linear accel, joint accel. For muduels
 
         Modules = []
         for is_red, positions in zip(result.is_red,result.positions):
